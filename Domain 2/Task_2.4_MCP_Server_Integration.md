@@ -1,217 +1,262 @@
-# Task 2.4 — Integrating MCP Servers into Claude Code & Agent Workflows
-### Zero-to-mastery study guide (every term defined; all 6 scenarios unfolded)
+# Task 2.4 — SUPPLEMENT: Attaching MCP Servers to Agents in CODE
+### The two programmatic paths the main guide skipped — Messages API connector vs Claude Agent SDK
 
-**Reading order:** Section 0 is the one idea. Sections 1–5 are the mechanics. Section 6 = anti-patterns, Section 7 = self-check. Then one section per scenario (8–13) in the fixed card shape.
-
----
-
-## 0. The one idea everything hangs on
-
-> **An MCP server is a plugin that hands Claude a bundle of tools (and optionally read-only "resources"). You wire it in at one of two scopes — *project* (`.mcp.json`, committed, shared with the team) or *user* (`~/.claude.json`, private, all your projects) — keep secrets out of the file with `${VAR}` expansion, and describe the tools well enough that Claude prefers them over weaker built-ins. All configured servers' tools are discovered at connect time and available together.**
-
-Everything here is: where the config lives (scope), how credentials stay safe (env expansion), what's exposed (tools + resources), and making the agent actually use them (descriptions).
+The main 2.4 guide covered MCP **inside Claude Code** (via `.mcp.json`). But when you're *building your own agent in code*, there are two other ways to attach MCP servers. This supplement shows both, with runnable code, and exactly how they differ.
 
 ---
 
-## 1. What MCP is, in one paragraph
+## 0. The three places MCP can be wired (so you don't mix them up)
 
-**MCP** (Model Context Protocol) is an open standard for connecting AI agents to external tools and data. An **MCP server** exposes capabilities; Claude Code (the client) connects and the server's **tools** become callable. Servers also expose **resources** (read-only, URI-addressed data the model can read as context) and **prompts** (templates). Transports: **stdio** (Claude spawns a local process) or **HTTP** (remote URL; SSE is the deprecated predecessor).
+| Where | How you attach MCP | Who runs the agent loop |
+|---|---|---|
+| **Claude Code** (the CLI/app) | `.mcp.json` / `~/.claude.json` (main guide) | Claude Code |
+| **Messages API** (raw `/v1/messages`) | `mcp_servers` parameter (the **MCP connector**) | **You** drive turns; Anthropic's API is the MCP client |
+| **Claude Agent SDK** (`claude-agent-sdk`) | `mcp_servers` in `ClaudeAgentOptions` | The **SDK** runs the full loop for you |
+
+This supplement is about rows 2 and 3.
 
 ---
 
-## 2. Scopes: where the config lives
+# PATH 1 — THE MESSAGES API "MCP CONNECTOR"
 
-| Scope | File | Shared? | Use for |
-|---|---|---|---|
-| **Project** | `.mcp.json` in the repo root | Committed to git → whole team | Shared team tooling (the team's Jira, DB) |
-| **User** | `~/.claude.json` | Private to you, across all your projects | Personal/experimental servers |
-| (Local) | `~/.claude.json`, keyed by project path | Private to you, this project only | Sensitive personal creds for one project |
+## 1.1 The idea (this is the surprising part)
 
-Add via CLI: `claude mcp add <name> --scope project ...` or `--scope user ...`. When the same server is defined in multiple scopes, Claude Code connects once using the highest-precedence definition (entries aren't merged).
+Normally *you* are the MCP client: your code connects to the MCP server, calls `tools/list`/`tools/call`, etc. The **MCP connector** flips that — you just name a **remote MCP server URL** in your API request, and **Anthropic's API itself becomes the MCP client**. Anthropic connects to that server during inference, discovers its tools, lets the model call them, executes the calls server-side, and returns the results to you. You write no MCP client code at all.
 
-```json
-// .mcp.json (project scope, committed)
-{ "mcpServers": {
-    "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/",
-                "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" } } } }
+**Key constraints (memorize these — they're exam-favorite distinctions):**
+- **Remote only.** The connector accepts `"type": "url"` servers (HTTP). It cannot launch a **local stdio** server. (Local servers → use the Agent SDK, Path 2.)
+- **Tools only.** It uses `tools/list` and `tools/call` — **resources and prompts are not exposed**, even if the server has them.
+- **Beta.** It requires a beta header / `betas` flag.
+- Not available on Amazon Bedrock or Google Vertex.
+
+## 1.2 The code (current pattern, beta `mcp-client-2025-11-20`)
+
+```python
+import anthropic
+client = anthropic.Anthropic()
+
+response = client.beta.messages.create(
+    model="claude-opus-4-8",
+    max_tokens=1000,
+    messages=[{"role": "user", "content": "Create a GitHub issue for the login bug."}],
+
+    # 1) Name the REMOTE MCP server(s) — Anthropic connects to these for you:
+    mcp_servers=[
+        {
+            "type": "url",                                   # remote only
+            "url": "https://api.githubcopilot.com/mcp/",
+            "name": "github",
+            "authorization_token": "YOUR_OAUTH_TOKEN",       # optional; pre-acquired
+        }
+    ],
+
+    # 2) Turn the server's tools on via an MCPToolset in the tools array
+    #    (this is the NEW location for tool config — see 1.3):
+    tools=[
+        {"type": "mcp_toolset", "mcp_server_name": "github"}   # all tools from "github"
+    ],
+
+    betas=["mcp-client-2025-11-20"],                          # the beta flag
+)
+print(response.content)
 ```
 
----
+Or as raw HTTP (note the header instead of `betas`):
 
-## 3. Environment-variable expansion (secrets without committing secrets)
-
-`.mcp.json` supports `${VAR}` and `${VAR:-default}` in `command`, `args`, `env`, `url`, and `headers`. The value is read from your **shell environment at connection time**, so the committed file holds the *structure* while the actual token stays in your environment (or `.env`, gitignored). This is how a team shares one config safely — if someone commits a real token by mistake, rotate it immediately.
-
-```json
-"env": { "DB_DSN": "${DATABASE_URL}" },
-"url": "${API_BASE_URL:-https://api.company.com}/mcp"
+```bash
+curl https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: mcp-client-2025-11-20" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-opus-4-8",
+    "max_tokens": 1000,
+    "messages": [{"role": "user", "content": "Create a GitHub issue for the login bug."}],
+    "mcp_servers": [
+      {"type": "url", "url": "https://api.githubcopilot.com/mcp/", "name": "github",
+       "authorization_token": "YOUR_OAUTH_TOKEN"}
+    ],
+    "tools": [{"type": "mcp_toolset", "mcp_server_name": "github"}]
+  }'
 ```
 
----
+## 1.3 Choosing which tools (allowlist/denylist) — and a version note
 
-## 4. Discovery and resources
+The `MCPToolset` in the `tools` array is where you scope which of the server's tools are usable (this is Task 2.3's distribution applied to the connector):
 
-**Simultaneous discovery:** tools from *all* configured servers are discovered when Claude connects (session start) and are available together. (With Tool Search on by default, definitions are deferred to save context, but the tools are still discoverable on demand.) Add a server mid-session → start a new session (for stdio) to pick up its tools.
+```python
+tools=[{
+    "type": "mcp_toolset",
+    "mcp_server_name": "github",
+    "allowed_tools": ["create_issue", "list_pull_requests"],   # only these two
+    # (denied_tools and per-tool defer_loading are also supported)
+}]
+```
 
-**Resources reduce exploratory calls.** A resource is read-only content the server exposes by URI — an issue-summary catalog, a documentation hierarchy, a database schema. Exposing these as resources gives the agent *visibility into what's available* up front, so it doesn't burn tool calls blindly probing ("what tables exist? what issues are open?"). The catalog is right there to read.
+**Version note (important):** the *older* connector beta (`mcp-client-2025-04-04`, now deprecated) put this config **inside the server object** as `tool_configuration`, not in a separate `tools` array:
 
----
+```python
+# OLD / deprecated style (mcp-client-2025-04-04):
+mcp_servers=[{
+    "type": "url", "url": "...", "name": "github", "authorization_token": "...",
+    "tool_configuration": {"enabled": True, "allowed_tools": ["create_issue"]}
+}]
+# extra_headers={"anthropic-beta": "mcp-client-2025-04-04"}
+```
+If you see `tool_configuration` inside the server object in a tutorial, it's the old pattern. New code puts an `mcp_toolset` in `tools`.
 
-## 5. Making the agent actually use MCP tools (+ build-vs-buy)
+## 1.4 Reading the result
 
-**Beat the built-ins with descriptions.** Claude defaults to familiar built-ins (like `Grep`). If your MCP tool is more capable but thinly described, the agent ignores it. **Enhance the MCP tool's description** to spell out its capability and output in detail so the agent prefers it when appropriate. (This is Task 2.1's discipline applied to MCP tools.)
+When the model uses a connector tool, the response contains **`mcp_tool_use`** and **`mcp_tool_result`** blocks (note the `mcp_` prefix — distinct from normal `tool_use`):
 
-**Buy before build.** For standard integrations (Jira, GitHub, Sentry), prefer an existing community/official MCP server over a custom one. Reserve custom servers for genuinely team-specific workflows. Less code to maintain, faster to adopt.
+```python
+for block in response.content:
+    if block.type == "mcp_tool_use":
+        print("Called:", block.name, block.input)
+    elif block.type == "mcp_tool_result":
+        print("Result error?", block.is_error)
+        print("Result:", block.content)
+```
 
----
-
-## 6. Anti-patterns (with *why*)
-- **Hardcoding tokens in `.mcp.json`.** It's committed; you've leaked a secret. Use `${VAR}` expansion.
-- **Personal/experimental server in project scope.** Pollutes everyone's config; put it in user scope (`~/.claude.json`).
-- **Thinly described MCP tools.** The agent keeps using built-in `Grep` instead; enrich the description.
-- **Building a custom Jira server.** Wasteful when a community server exists; build only team-specific tooling.
-- **No resources for a known catalog.** The agent wastes calls probing for schema/issues you could have exposed as a resource.
-- **Expecting mid-session stdio tools without reconnecting.** stdio tools load at session start; restart to pick them up.
-
----
-
-## 7. Self-check (core mechanics)
-1. Project vs user scope files? → `.mcp.json` (committed, team) vs `~/.claude.json` (private, all your projects).
-2. How do you keep a token out of a committed config? → `${VAR}` expansion (read from the shell at connect time).
-3. When are tools from configured servers available? → All discovered at connection time, available together.
-4. What's an MCP resource for? → Exposing read-only catalogs (schemas, issue lists) to cut exploratory tool calls.
-5. Why does the agent prefer `Grep` over a better MCP tool? → The MCP tool's description is too thin; enrich it.
-6. Build or buy for Jira? → Buy (community server); custom only for team-specific workflows.
-7. (Ties to §0) One sentence? → *Wire the right scope, hide secrets with `${VAR}`, expose resources, and describe tools so the agent uses them.*
-
----
-
-## 8. Scenario 1 — Customer Support Resolution Agent
-
-> **Scenario 1 (as given):** *Customer support resolution agent on the Agent SDK; high-ambiguity returns/billing/account requests; MCP tools `get_customer`, `lookup_order`, `process_refund`, `escalate_to_human`; target 80%+ first-contact resolution.*
-
-**What this scenario is even about (plain English):** A support agent acting through four backend MCP tools (see Domain-1 §7).
-
-**The key link to everything above:** **Strong fit.** Those four tools come from an MCP server you configure. Team-shared → **project scope** `.mcp.json`; the backend auth token → `${SUPPORT_API_TOKEN}` expansion (never committed). A **resource** exposing the refund-policy catalog or order-status schema lets the agent answer policy questions without extra probing calls.
-
-### 8a. Project scope + env expansion
-Commit the server definition; keep the token in the environment via `${SUPPORT_API_TOKEN}` so the whole support team shares config safely.
-
-### 8b. Policy catalog as a resource
-Expose the returns/refund policy as a resource so the agent reads eligibility rules directly instead of guessing or calling extra tools.
-
-### 8c. Scenario-1 self-check
-1. Scope for the shared support server? → Project (`.mcp.json`).
-2. Where does the API token live? → Shell env via `${VAR}`; not in the file.
-3. (Goal tie) How does a policy resource help FCR? → The agent resolves policy questions immediately, no exploratory calls.
+Because Anthropic executed the tool for you, you don't run a tool loop here — the result already came back in one response.
 
 ---
 
-## 9. Scenario 2 — Code Generation Pipeline
+# PATH 2 — THE CLAUDE AGENT SDK
 
-> **Scenario 2 (paraphrased — confirm against your exam copy):** *Multi-step code generation: plan → write → test → complete.*
+## 2.1 The idea
 
-**What this scenario is even about (plain English):** An agent writing code in stages (see Domain-1 §8).
+The **Claude Agent SDK** (`claude-agent-sdk` in Python, `@anthropic-ai/claude-agent-sdk` in TS) gives you the *entire Claude Code agent loop* callable from your own program — tool execution, context management, permissions, subagents — without an interactive terminal. (It's the renamed successor of the "Claude Code SDK.") Here, **the SDK is the MCP client**, and it supports **all three** server kinds:
 
-**The key link to everything above:** **Partial-to-strong fit.** The pipeline pulls in MCP servers for test runners, package registries, or a build service — team-shared, so **project scope**. Exposing the project's test/build config or dependency manifest as a **resource** saves the agent from probing for how to run things.
+| Type in `mcp_servers` | What it is | Config |
+|---|---|---|
+| **`stdio`** | A **local** process the SDK launches | `command` + `args` + `env` |
+| **`http`** / **`sse`** | A **remote** server by URL | `url` + `headers` |
+| **`sdk`** | An **in-process** server — your own Python/TS functions, no subprocess | `create_sdk_mcp_server(...)` |
 
-### 9a. Shared toolchain in project scope
-The CI/test MCP server lives in `.mcp.json` so every contributor's agent uses the same toolchain.
+That last one (`sdk`) is unique to the Agent SDK: your tools run *inside your application*, no separate process, no network — fastest and simplest for custom tools.
 
-### 9b. Scenario-2 self-check
-1. Scope for the shared test-runner server? → Project.
-2. What cuts "how do I run tests?" probing? → A resource exposing the test/build config.
+## 2.2 Local (stdio) and remote (http) servers — code
+
+```python
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+
+options = ClaudeAgentOptions(
+    mcp_servers={
+        # LOCAL (stdio): the SDK runs this command on your machine
+        "github": {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github"],
+            "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},     # ${VAR} expansion works
+        },
+        # REMOTE (http): the SDK connects to this URL
+        "docs": {
+            "type": "http",
+            "url": "https://code.claude.com/docs/mcp",
+            "headers": {"Authorization": "Bearer ${API_TOKEN}"},
+        },
+    },
+    # YOU MUST allowlist the tools (see 2.4) or the agent can't call them:
+    allowed_tools=["mcp__github__create_issue", "mcp__docs__*"],
+)
+
+async def main():
+    async for msg in query(prompt="Open an issue for the login bug.", options=options):
+        if isinstance(msg, ResultMessage) and msg.subtype == "success":
+            print(msg.result)
+
+asyncio.run(main())
+```
+
+Note: unlike the Messages API connector, the SDK **runs the whole loop** — it discovers tools, lets the model call them, executes them, and continues until done. You just read the streamed messages.
+
+## 2.3 In-process (`sdk`) server — define tools as plain functions
+
+No subprocess, no URL — your own functions become MCP tools:
+
+```python
+from claude_agent_sdk import tool, create_sdk_mcp_server, ClaudeAgentOptions
+
+# 1) Define tools with the @tool decorator (name, description, input schema)
+@tool("add", "Add two numbers", {"a": float, "b": float})
+async def add(args):
+    return {"content": [{"type": "text", "text": f"Sum: {args['a'] + args['b']}"}]}
+
+@tool("multiply", "Multiply two numbers", {"a": float, "b": float})
+async def multiply(args):
+    return {"content": [{"type": "text", "text": f"Product: {args['a'] * args['b']}"}]}
+
+# 2) Bundle them into an in-process MCP server
+calculator = create_sdk_mcp_server(name="calc", version="1.0.0", tools=[add, multiply])
+
+# 3) Attach it exactly like any other MCP server
+options = ClaudeAgentOptions(
+    mcp_servers={"calc": calculator},                        # the SDK server object
+    allowed_tools=["mcp__calc__add", "mcp__calc__multiply"], # allowlist
+)
+```
+
+## 2.4 THE GOTCHA: connecting ≠ allowed (the `allowed_tools` rule)
+
+This trips everyone. In the Agent SDK, **merely attaching a server does not let the agent call its tools.** You must list them in `allowed_tools` using the namespaced name `mcp__<server>__<tool>` (wildcards like `mcp__github__*` work):
+
+```python
+allowed_tools=["mcp__github__create_issue"]   # auto-approved, runs without a prompt
+# Anything not listed falls through to the permission flow / is blocked.
+# To explicitly block tools, use disallowed_tools=[...].
+```
+
+So `allowed_tools` is the Agent SDK's tool-distribution lever (Task 2.3): scope each agent to exactly the namespaced tools its role needs, and nothing else.
+
+## 2.5 You can mix all three in one agent
+
+```python
+options = ClaudeAgentOptions(
+    mcp_servers={
+        "calc":     calculator,                                       # in-process (sdk)
+        "github":   {"type": "stdio", "command": "npx",
+                     "args": ["-y", "@modelcontextprotocol/server-github"]},  # local
+        "docs":     {"type": "http", "url": "https://code.claude.com/docs/mcp"}, # remote
+    },
+    allowed_tools=["mcp__calc__*", "mcp__github__create_issue", "mcp__docs__*"],
+)
+```
+
+All three are discovered at startup and merged into one namespaced tool list (the Part C mechanism from the main guide). The model picks by description; the `mcp__<server>__` prefix routes each call to the right server — local, remote, or in-process alike.
+
+## 2.6 The Agent SDK also reads `.mcp.json`
+
+The SDK can pick up the same `.mcp.json` file Claude Code uses, so project servers are shared between the CLI and your SDK app. You can define servers in code (above) *or* in `.mcp.json` — your choice.
 
 ---
 
-## 10. Scenario 3 — Multi-Source Research Coordinator
+# PART 3 — WHICH PATH SHOULD YOU USE? (decision table)
 
-> **Scenario 3 (paraphrased — confirm against your exam copy):** *Coordinator spawns search/analysis subagents and a synthesis subagent for a cited answer.*
+| If you want… | Use |
+|---|---|
+| A **remote** MCP server, minimal code, you control each turn, no client to run | **Messages API connector** (`mcp_servers` param) |
+| **Local stdio** servers, **in-process** custom tools, the **full agent loop** handled for you, subagents/hooks/permissions, **resources** support | **Claude Agent SDK** |
+| MCP inside the **interactive CLI / app** for developers | **Claude Code** + `.mcp.json` (main guide) |
 
-**What this scenario is even about (plain English):** A manager agent delegating research, then synthesizing (see Domain-1 §9).
-
-**The key link to everything above:** **Strong fit.** Research integrates several MCP servers (web search, a docs server, a database). All their tools are **discovered together at connect time** (§4), so the coordinator sees the full toolset. A **documentation-hierarchy resource** or **database-schema resource** gives the agent a map up front, sharply cutting exploratory calls before it knows what's there.
-
-### 10a. Multiple servers, one toolset
-Configure search + docs + DB servers; their tools are available simultaneously to the coordinator.
-
-### 10b. Catalogs as resources
-Expose the doc hierarchy and DB schema as resources so subagents target the right source immediately instead of probing.
-
-### 10c. Scenario-3 self-check
-1. When are multi-server tools available? → All at connection time, together.
-2. How to cut exploratory calls across sources? → Expose catalogs (doc tree, schema) as resources.
+Quick rules of thumb:
+- **Server gives you a command to run** (`npx ...`) → it's stdio → **Agent SDK** (connector can't do stdio).
+- **Server gives you a URL** → either works; pick by whether you want the SDK's full loop or the connector's lightness.
+- **Your own custom functions as tools** → Agent SDK **`sdk`** (in-process) server.
 
 ---
 
-## 11. Scenario 4 — Developer Productivity with Claude
+# PART 4 — ONE-SCREEN RECAP
 
-> **Scenario 4 (as given):** *Agent SDK over real repos; built-in tools Read, Write, Edit, Bash, Grep, Glob; integrates MCP; explores codebases, handles legacy, generates boilerplate, automates chores.*
-
-**What this scenario is even about (plain English):** A coding assistant across a real repo (see Domain-1 §10).
-
-**The key link to everything above:** **Core fit — the home scenario.** Every 2.4 idea lands: a shared GitHub/Jira server in **project** `.mcp.json` with `${GITHUB_TOKEN}` expansion; a personal experimental server in **user** `~/.claude.json`; **buy** the community Jira/GitHub server rather than building one; and crucially, **enrich descriptions so a capable MCP code-search tool isn't ignored in favor of built-in `Grep`** (§5) — the canonical example.
-
-### 11a. Project vs user placement
-Team's GitHub/Jira → project scope (committed, shared). Your experimental scratch server → user scope (private).
-
-### 11b. Beat `Grep` with description quality
-A semantic/cross-repo MCP search tool must advertise what it does beyond `Grep`, or the agent defaults to `Grep` and never uses it.
-
-### 11c. Buy the standard integration
-Use the official GitHub MCP server; reserve custom servers for your team's bespoke workflows.
-
-### 11d. Scenario-4 self-check
-1. Team GitHub server scope? → Project (`.mcp.json`), token via `${GITHUB_TOKEN}`.
-2. Personal experiment scope? → User (`~/.claude.json`).
-3. Why is the MCP search tool ignored? → Thin description; the agent prefers built-in `Grep`. Fix: enrich it.
-4. Build a Jira server? → No — buy the community one; build only team-specific tools.
-
----
-
-## 12. Scenario 5 — CI/CD Code Review Agent
-
-> **Scenario 5 (paraphrased — confirm against your exam copy):** *Claude Code in CI reviews each PR headlessly (`claude -p`), emits JSON, a script gates the merge; minimize false positives.*
-
-**What this scenario is even about (plain English):** An automated PR reviewer in the pipeline (see Domain-1 §11).
-
-**The key link to everything above:** **Strong fit.** The CI environment must load the review tooling reproducibly, so the MCP server belongs in **project** `.mcp.json` (committed → every CI run identical), with the CI token supplied via env expansion from the pipeline's secret store. Exposing the repo's lint-rules or coding-standards as a **resource** gives the reviewer the project's standards directly, reducing false positives from guessing.
-
-### 12a. Reproducible config in project scope
-`.mcp.json` committed means the CI runner and every developer review the same way — determinism that matters in a gate.
-
-### 12b. Standards as a resource
-Expose coding standards/lint config as a resource so the reviewer judges against the real rules, not assumptions (fewer false positives).
-
-### 12c. Scenario-5 self-check
-1. Scope for reproducible CI tooling? → Project (`.mcp.json`), committed.
-2. Where does the CI token come from? → Pipeline secret → `${VAR}` expansion.
-3. How does a standards resource cut false positives? → The reviewer checks real rules instead of guessing.
-
----
-
-## 13. Scenario 6 — Structured Data Extraction
-
-> **Scenario 6 (paraphrased — confirm against your exam copy):** *Extract from unstructured docs, validate against JSON schemas, high accuracy, graceful edge cases, downstream integration.*
-
-**What this scenario is even about (plain English):** Turn messy documents into clean schema-checked records (see Domain-1 §12).
-
-**The key link to everything above:** **Strong fit.** The extractor connects MCP servers for document sources and the downstream system; shared → **project scope**, credentials via env expansion. The killer 2.4 move: expose the **target JSON schema (and any reference catalogs) as resources** so the agent reads the exact output shape up front — directly supporting accuracy and clean downstream integration — rather than inferring it.
-
-### 13a. Schema as a resource
-Publish the output schema as an MCP resource; the extractor reads it and produces conforming records, tightening accuracy.
-
-### 13b. Project scope for shared sources
-Document-source and downstream servers live in `.mcp.json` with `${VAR}` credentials so the whole pipeline shares config.
-
-### 13c. Scenario-6 self-check
-1. How to give the agent the exact output shape? → Expose the JSON schema as a resource.
-2. Scope for shared document/downstream servers? → Project, with env-expanded credentials.
-3. (Goal tie) How does a schema resource serve "high accuracy"? → The agent extracts against the real schema instead of guessing the shape.
+- **Messages API MCP connector:** add `mcp_servers=[{"type":"url", "url":..., "name":..., "authorization_token":...}]` + an `mcp_toolset` in `tools` + `betas=["mcp-client-2025-11-20"]`. **Remote (URL) only, tools-only, beta.** Anthropic's API acts as the MCP client and executes calls for you; results come back as `mcp_tool_use`/`mcp_tool_result` blocks. (Old `mcp-client-2025-04-04` put config in `tool_configuration` inside the server — deprecated.)
+- **Claude Agent SDK:** set `ClaudeAgentOptions(mcp_servers={...}, allowed_tools=[...])`. Three server types: **`stdio`** (local command), **`http`/`sse`** (remote URL), **`sdk`** (in-process via `create_sdk_mcp_server` + `@tool`). The SDK runs the whole loop. **You MUST allowlist tools** as `mcp__<server>__<tool>` — attaching alone isn't enough.
+- Both namespace tools `mcp__<server>__<tool>`; the prefix routes calls. Connector = remote-only/lightweight; SDK = all transports + full agent loop + resources.
 
 ---
 
 ### Sources verified against current Anthropic docs (June 2026)
-- *Connect Claude Code to tools via MCP* (code.claude.com) — scopes: **project** (`.mcp.json`, committable/team), **user** (`~/.claude.json`, cross-project private), local (default, `~/.claude.json` keyed by project path); `claude mcp add --scope ...`, `-e`, `--`; duplicate servers resolved by highest-precedence scope (no field merge); `${VAR}` and `${VAR:-default}` expansion in `command`/`args`/`env`/`url`/`headers`, read from the shell at connection time; tools from all servers discovered at connection time; Tool Search defers definitions; SSE deprecated in favor of HTTP.
-- *MCP specification — Resources* (modelcontextprotocol.io) — read-only, URI-addressed data (schemas, catalogs, docs) the model consumes as context.
-- Build-vs-buy and "enrich descriptions so MCP beats built-in `Grep`" reflect the task statement and tool-description best practices. MCP config UX ships fast — re-verify flag/file specifics against current docs.
+- *MCP connector* (platform.claude.com) — `mcp_servers` array on the Messages API; **remote `type:"url"` only**; new beta header **`mcp-client-2025-11-20`** with tool config moved to the `tools` array as **`mcp_toolset`** objects (old `mcp-client-2025-04-04` used `tool_configuration` inside the server, now deprecated); connector calls only `tools/list`/`tools/call` (no resources/prompts); responses carry `mcp_tool_use`/`mcp_tool_result` blocks; supports `allowed_tools`/`denied_tools`/per-tool `defer_loading`; not on Bedrock/Vertex.
+- *Connect MCP servers / Agent SDK reference (Python & TS)* (platform.claude.com, code.claude.com, github.com/anthropics/claude-agent-sdk-python) — `ClaudeAgentOptions(mcp_servers={...}, allowed_tools=[...])`; server types `stdio` (command/args/env), `http`/`sse` (url/headers), and `sdk` via `create_sdk_mcp_server(name, version, tools)` with `@tool`-decorated functions (in-process, no subprocess); tools namespaced `mcp__<server>__<tool>`; **attaching a server does NOT grant use — you must allowlist via `allowed_tools`** (wildcards allowed; `disallowed_tools` to block); `${VAR}` expansion in `.mcp.json`; the SDK can also read `.mcp.json`.
+- Both surfaces are beta/fast-moving (the connector header changed from `2025-04-04`→`2025-11-20`; "Claude Code SDK" was renamed "Claude Agent SDK") — re-verify header/field names against current docs before production.
