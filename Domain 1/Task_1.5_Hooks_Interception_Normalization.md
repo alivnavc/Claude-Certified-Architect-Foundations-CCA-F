@@ -268,6 +268,58 @@ After normalization, validate against the JSON schema in the same/adjacent hook;
 3. Why normalize in a hook not the prompt? → Guaranteed (deterministic) clean data; prompts are probabilistic.
 4. (Goal tie) How does this serve "high accuracy"? → The model and downstream only ever see uniform, schema-valid records, removing a whole class of reasoning errors.
 
+```
+import asyncio
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher
+
+
+# This is YOUR function. The SDK runs it before a tool is used.
+# It always receives these 3 things (you only need the first one for now).
+async def check_before_tool(input_data, tool_use_id, context):
+
+    # What is the agent trying to do? (the tool name)
+    tool_name = input_data["tool_name"]
+
+    # What details did it pass? (a dictionary of arguments)
+    arguments = input_data["tool_input"]
+
+    # Example rule: don't allow refunds over $100
+    if tool_name == "issue_refund":
+        amount = arguments.get("amount", 0)
+        if amount > 100:
+            # This is the GATE. "deny" stops the tool.
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "Refunds over $100 need a manager.",
+                }
+            }
+
+    # Returning an empty dictionary means "no objection, carry on."
+    return {}
+
+
+async def main():
+    options = ClaudeAgentOptions(
+        hooks={
+            # "PreToolUse" = run this BEFORE any tool is used
+            "PreToolUse": [
+                # matcher = only watch the refund tool
+                # hooks = run my function
+                HookMatcher(matcher="issue_refund", hooks=[check_before_tool])
+            ]
+        }
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query("Please refund $250 to this customer")
+        async for message in client.receive_response():
+            print(message)
+
+
+asyncio.run(main())
+```
 ---
 
 ### Sources verified against current Anthropic docs (June 2026)
